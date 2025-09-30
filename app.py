@@ -5,7 +5,9 @@ from __future__ import annotations
 from functools import lru_cache
 from itertools import combinations
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
+import io
+import zipfile
 
 import pandas as pd
 import streamlit as st
@@ -131,6 +133,49 @@ def _to_category_list(value: object) -> List[str]:
     if isinstance(value, str) and value.strip():
         return [value]
     return []
+
+
+@st.cache_data(show_spinner=False)
+def load_filtered_votes(
+    member_ids: Tuple[int, ...],
+    main_only: bool,
+    categories: Tuple[str, ...],
+) -> pd.DataFrame:
+    """Return cached vote matrix filtered by vote type and subject categories."""
+    base = build_vote_matrix(list(member_ids))
+    if base.empty:
+        return base
+
+    filtered = base.copy()
+
+    if main_only:
+        filtered = filtered[filtered["is_main"]]
+
+    if categories:
+        category_set = set(categories)
+        filtered = filtered[
+            filtered["top_subjects"].apply(
+                lambda cats: bool(set(_to_category_list(cats)) & category_set)
+            )
+        ]
+
+    return filtered.reset_index(drop=True)
+
+
+PAIR_DELIMITER = "||"
+
+
+def encode_pair_token(left: str, right: str) -> str:
+    return f"{left}{PAIR_DELIMITER}{right}"
+
+
+def decode_pair_token(token: str) -> Tuple[str, str] | None:
+    if not token or PAIR_DELIMITER not in token:
+        return None
+    left, right = token.split(PAIR_DELIMITER, 1)
+    if not left or not right:
+        return None
+    return left, right
 
 
 def build_vote_matrix(selected_member_ids: List[int]) -> pd.DataFrame:
@@ -341,6 +386,79 @@ def pairwise_agreement(
     return pd.DataFrame(rows)
 
 
+def pairwise_trend(
+    df: pd.DataFrame,
+    left: str,
+    right: str,
+    frequency: str = "M",
+) -> pd.DataFrame:
+    """Summarise agreement between two members across time buckets."""
+    if df.empty or left not in df.columns or right not in df.columns:
+        return pd.DataFrame()
+
+    subset = df[["timestamp", left, right]].dropna().copy()
+    if subset.empty:
+        return pd.DataFrame()
+
+    subset["timestamp"] = pd.to_datetime(subset["timestamp"], errors="coerce")
+    subset = subset.dropna(subset=["timestamp"])
+    if subset.empty:
+        return pd.DataFrame()
+
+    if subset["timestamp"].dt.tz is not None:
+        subset["timestamp"] = subset["timestamp"].dt.tz_convert(None)
+
+    subset["same"] = (subset[left] == subset[right]).astype(int)
+    subset["period"] = subset["timestamp"].dt.to_period(frequency).dt.to_timestamp()
+
+    grouped = (
+        subset.groupby("period")
+        .agg(total_votes=("timestamp", "count"), same_votes=("same", "sum"))
+        .reset_index()
+        .sort_values("period")
+    )
+
+    if grouped.empty:
+        return pd.DataFrame()
+
+    grouped["agreement_rate"] = (grouped["same_votes"] / grouped["total_votes"]).fillna(
+        0.0
+    )
+    grouped["left"] = left
+    grouped["right"] = right
+    return grouped
+
+
+def pairwise_trend_chart(trend_df: pd.DataFrame) -> alt.Chart | None:
+    if trend_df.empty:
+        return None
+
+    chart = (
+        alt.Chart(trend_df)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("period:T", title="Vote month"),
+            y=alt.Y(
+                "agreement_rate:Q",
+                title="Agreement rate",
+                axis=alt.Axis(format="%"),
+            ),
+            tooltip=[
+                alt.Tooltip("period:T", title="Period"),
+                alt.Tooltip(
+                    "agreement_rate:Q",
+                    title="Agreement",
+                    format=".0%",
+                ),
+                alt.Tooltip("same_votes:Q", title="Same votes"),
+                alt.Tooltip("total_votes:Q", title="Total votes"),
+            ],
+        )
+        .properties(height=260, width="container")
+    )
+    return chart
+
+
 def category_breakdown(df: pd.DataFrame) -> pd.DataFrame:
     """Summarise filtered votes by their top-level OEIL subjects."""
     if df.empty or "top_subjects" not in df.columns:
@@ -482,6 +600,36 @@ def category_agreement_chart(breakdown: pd.DataFrame) -> alt.Chart | None:
     return chart
 
 
+def build_summary_metrics(
+    total_votes: int, same_votes: int, different_votes: int
+) -> pd.DataFrame:
+    data = [
+        {"Metric": "Shared votes analysed", "Value": total_votes},
+        {"Metric": "Votes with identical positions", "Value": same_votes},
+        {"Metric": "Votes with differing positions", "Value": different_votes},
+    ]
+    return pd.DataFrame(data)
+
+
+def build_export_package(
+    detail_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    breakdown_df: pd.DataFrame,
+    pairwise_df: pd.DataFrame,
+) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("votes.csv", detail_df.to_csv(index=False))
+        archive.writestr("summary.csv", summary_df.to_csv(index=False))
+        if not breakdown_df.empty:
+            archive.writestr("category_breakdown.csv", breakdown_df.to_csv(index=False))
+        if not pairwise_df.empty:
+            archive.writestr("pairwise_agreement.csv", pairwise_df.to_csv(index=False))
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 @st.cache_data(show_spinner=False)
 def load_last_updated() -> str:
     """Get the timestamp of the source dataset if available."""
@@ -492,8 +640,111 @@ def load_last_updated() -> str:
 
 
 def main() -> None:
-    st.set_page_config(page_title="EU Parliament Vote Comparator", layout="wide")
+    st.set_page_config(
+        page_title="EU Parliament Vote Comparator",
+        page_icon="🇪🇺",
+        layout="wide",
+    )
+    st.markdown(
+        """
+        <style>
+        :root {
+            --eu-primary: #2841f5;
+            --eu-soft: #f5f7ff;
+            --eu-border: rgba(40, 65, 245, 0.22);
+        }
+        .stApp .main .block-container {
+            padding-top: 2rem;
+            max-width: 1200px;
+        }
+        .intro-card {
+            background: linear-gradient(135deg, rgba(40, 65, 245, 0.08), rgba(40, 65, 245, 0.02));
+            border-radius: 1rem;
+            border: 1px solid var(--eu-border);
+            padding: 1.25rem 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+        .intro-card p {
+            margin-bottom: 0.5rem;
+        }
+        .intro-card ul {
+            margin: 0;
+            padding-left: 1.1rem;
+        }
+        .intro-card li {
+            margin-bottom: 0.35rem;
+        }
+        .stApp div[data-testid="stTabs"] div[role="tablist"] {
+            gap: 0.5rem;
+        }
+        .stApp div[data-testid="stTabs"] button[role="tab"] {
+            background: var(--eu-soft);
+            color: #111827;
+            padding: 0.8rem 1.4rem;
+            border-radius: 0.8rem;
+            border: 1px solid var(--eu-border);
+            font-weight: 600;
+            font-size: 1rem;
+            transition: all 0.2s ease-in-out;
+        }
+        .stApp div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+            background: var(--eu-primary);
+            color: #ffffff;
+            box-shadow: 0 8px 18px rgba(40, 65, 245, 0.2);
+            border-color: var(--eu-primary);
+        }
+        .stApp div[data-testid="stTabs"] button[role="tab"]:hover {
+            border-color: var(--eu-primary);
+            color: var(--eu-primary);
+        }
+        .stApp div[data-testid="stTabs"] div[data-baseweb="tab-content"] {
+            background: #ffffff;
+            border-radius: 1rem;
+            border: 1px solid rgba(40, 65, 245, 0.1);
+            padding: 1.5rem;
+            margin-top: 0.75rem;
+        }
+        div[data-testid="metric-container"] {
+            background: var(--eu-soft);
+            border: 1px solid rgba(40, 65, 245, 0.1);
+            border-radius: 0.8rem;
+            padding: 1rem;
+        }
+        div[data-testid="metric-container"] div[data-testid="stMetricLabel"] {
+            color: #111827;
+            font-weight: 600;
+        }
+        div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
+            color: #111827;
+        }
+        @media (max-width: 768px) {
+            .stApp div[data-testid="stTabs"] button[role="tab"] {
+                font-size: 0.95rem;
+                padding: 0.7rem 1rem;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.title("European Parliament Vote Comparator")
+    st.caption(
+        "Understand how Members of the European Parliament vote together across policy areas."
+    )
+    st.markdown(
+        """
+        <div class="intro-card">
+            <p><strong>Make sense of shared roll-call votes in seconds.</strong></p>
+            <ul>
+                <li><strong>Select members:</strong> pick individual names or load a handy preset from the sidebar.</li>
+                <li><strong>Refine the focus:</strong> filter by vote type or OEIL subjects to narrow the dataset.</li>
+                <li><strong>Explore the tabs:</strong> Subjects summarise topics, Agreement highlights alignment, and Votes lists every record.</li>
+            </ul>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     members = load_members()
     member_names = members["full_name"].tolist()
@@ -538,16 +789,61 @@ def main() -> None:
     ]
     focus_default = params.get("focus", "")
 
-    st.sidebar.header("Select members")
+    st.sidebar.header("Choose members")
+    st.sidebar.markdown(
+        "Search by name or country code, or load a quick preset to explore an example comparison."
+    )
+
+    quick_groups = {
+        "Load Czech comparison": [
+            "Filip TUREK (CZE)",
+            "Kateřina KONEČNÁ (CZE)",
+            "Alexandr VONDRA (CZE)",
+            "Jan FARSKÝ (CZE)",
+            "Danuše NERUDOVÁ (CZE)",
+            "Luděk NIEDERMAYER (CZE)",
+        ],
+    }
+
+    if "member_selection_override" in st.session_state:
+        st.session_state["member_selection"] = st.session_state.pop(
+            "member_selection_override"
+        )
+
+    st.session_state.setdefault("member_selection", default_selected_members)
+
     selected = st.sidebar.multiselect(
         "Members of the European Parliament",
         options=member_names,
-        max_selections=6,
-        default=default_selected_members,
-        help="Choose up to six members to compare their voting records.",
+        max_selections=20,
+        key="member_selection",
+        help="Choose up to twenty members to compare their voting records.",
     )
 
+    def apply_quick_selection(names: List[str]) -> None:
+        missing = [name for name in names if name not in member_names]
+        if missing:
+            st.warning(
+                "Some quick-selection members are missing from the dataset and were skipped: "
+                + ", ".join(missing)
+            )
+        updated = list(dict.fromkeys([*selected, *names]))
+        st.session_state["member_selection_override"] = [
+            name for name in updated if name in member_names
+        ][:20]
+        st.session_state["_rerun"] = not st.session_state.get("_rerun", False)
+        st.rerun()
+
+    for label, names in quick_groups.items():
+        if st.sidebar.button(label):
+            apply_quick_selection(names)
+
+    st.sidebar.caption("Compare up to twenty members at once.")
     st.sidebar.divider()
+    st.sidebar.subheader("Refine votes")
+    st.sidebar.markdown(
+        "Focus on specific vote types and subjects to tailor the analysis."
+    )
     main_only = st.sidebar.toggle(
         "Only include main votes",
         value=default_main_only,
@@ -592,19 +888,20 @@ def main() -> None:
 
     if top_category_options:
         st.sidebar.caption(
-            f"{len(filtered_category_options)} matching of {len(top_category_options)} available subjects."
+            f"{len(filtered_category_options)} of {len(top_category_options)} subjects match your search."
         )
     else:
-        st.sidebar.caption(
-            "Subject metadata is unavailable in the current dataset release."
-        )
+        st.sidebar.caption("Subject metadata isn't available in this dataset release.")
 
-    st.sidebar.caption(f"Dataset last updated: {load_last_updated()}")
+    st.sidebar.caption(f"Dataset last updated • {load_last_updated()}")
 
     name_to_id = dict(zip(members["full_name"], members["id"]))
     selected_ids = [name_to_id[name] for name in selected]
 
-    def sync_query_params(focus_value: str | None = None) -> None:
+    def sync_query_params(
+        focus_value: str | None = None,
+        pair_value: str | None = None,
+    ) -> None:
         payload = {
             "main_only": [str(main_only).lower()],
             "filter": [filter_option],
@@ -617,6 +914,8 @@ def main() -> None:
             payload["subjects"] = selected_top_categories
         if focus_value:
             payload["focus"] = [focus_value]
+        if pair_value:
+            payload["pair"] = [pair_value]
 
         candidate = {}
         for key, value in payload.items():
@@ -640,18 +939,9 @@ def main() -> None:
         st.info("Select at least one member to begin exploring voting patterns.")
         return
 
-    vote_matrix = build_vote_matrix(selected_ids)
-
-    if main_only:
-        vote_matrix = vote_matrix[vote_matrix["is_main"]]
-
-    if selected_top_categories and not vote_matrix.empty:
-        selected_set = set(selected_top_categories)
-        vote_matrix = vote_matrix[
-            vote_matrix["top_subjects"].apply(
-                lambda cats: bool(set(_to_category_list(cats)) & selected_set)
-            )
-        ]
+    member_id_tuple = tuple(selected_ids)
+    category_tuple = tuple(selected_top_categories)
+    vote_matrix = load_filtered_votes(member_id_tuple, main_only, category_tuple)
 
     if vote_matrix.empty:
         sync_query_params()
@@ -660,11 +950,12 @@ def main() -> None:
         )
         return
 
+    selected_names = [member_lookup()[mid] for mid in selected_ids]
     same_votes = (vote_matrix["agreement"] == "Same").sum()
     different_votes = (vote_matrix["agreement"] == "Different").sum()
 
     total_votes = len(vote_matrix)
-    st.subheader("At a glance")
+    st.subheader("Overview at a glance")
     col1, col2, col3 = st.columns(3)
     col1.metric("Shared votes analysed", total_votes)
     col2.metric("Votes with identical positions", same_votes)
@@ -673,6 +964,10 @@ def main() -> None:
         "Metrics summarise all shared votes that match the sidebar filters. "
         "Use the options below to focus on specific agreement patterns."
     )
+    st.markdown("### Focus the analysis")
+    st.caption(
+        "Choose which voting pattern to emphasise throughout the charts and tables."
+    )
 
     filter_index = filter_options.index(filter_option)
     filter_option = st.radio(
@@ -680,6 +975,7 @@ def main() -> None:
         filter_options,
         index=filter_index,
         horizontal=True,
+        help="Limit the analysis to votes where the selected members agreed or differed.",
     )
 
     filtered = vote_matrix.copy()
@@ -689,71 +985,131 @@ def main() -> None:
         filtered = filtered[filtered["agreement"] == "Different"]
 
     breakdown = category_breakdown(filtered)
-    detail_focus: str | None = None
-    if not breakdown.empty:
-        st.subheader("Category breakdown")
-        st.caption(
-            "Counts reflect the top-level OEIL subjects represented in the current "
-            "selection of shared votes."
-        )
-        category_chart = category_agreement_chart(breakdown)
-        if category_chart is not None:
-            st.altair_chart(category_chart, use_container_width=True)
-
-        subjects_in_breakdown = breakdown["Top-level subject"].tolist()
-        category_options = ["All categories", *subjects_in_breakdown]
-        default_focus_option = (
-            focus_default
-            if focus_default in subjects_in_breakdown
-            else "All categories"
-        )
-        focus_selection = st.selectbox(
-            "Drill down on a subject",
-            options=category_options,
-            index=category_options.index(default_focus_option),
-            help="Highlight the detailed table with votes tagged to a specific subject.",
-        )
-        if focus_selection != "All categories":
-            detail_focus = focus_selection
-
-        st.dataframe(
-            breakdown,
-            use_container_width=True,
-            hide_index=True,
-        )
-
+    summary_metrics = build_summary_metrics(total_votes, same_votes, different_votes)
+    pairwise_df = pairwise_agreement(filtered, selected_ids)
     heatmap_chart = pairwise_agreement_heatmap(filtered, selected_ids)
-    if heatmap_chart is not None:
-        st.subheader("Agreement heatmap")
-        st.caption(
-            "Colour intensity denotes how closely each pair aligns within the current selection."
-        )
-        st.altair_chart(heatmap_chart, use_container_width=True)
 
-    pairwise = pairwise_agreement(filtered, selected_ids)
-    if not pairwise.empty:
-        st.subheader("Pairwise agreement overview")
+    st.markdown("### Explore the results")
+    st.caption(
+        "Switch between the tabs to compare subjects, pairwise agreement, and the full vote log."
+    )
+
+    pair_label_to_members: Dict[str, Tuple[str, str]] = {}
+    pair_label_to_token: Dict[str, str] = {}
+    pair_options = ["No pair selected"]
+    for left, right in combinations(selected_names, 2):
+        label = f"{left} ↔ {right}"
+        token = encode_pair_token(left, right)
+        pair_label_to_members[label] = (left, right)
+        pair_label_to_token[label] = token
+        pair_options.append(label)
+
+    pair_default_label = "No pair selected"
+    pair_param = params.get("pair", "")
+    if pair_param:
+        decoded = decode_pair_token(pair_param)
+        if decoded:
+            candidate_label = f"{decoded[0]} ↔ {decoded[1]}"
+            if candidate_label in pair_label_to_members:
+                pair_default_label = candidate_label
+
+    detail_focus_label: str | None = None
+    selected_pair_label: str | None = None
+    selected_pair_token: str | None = None
+
+    summary_tab, agreement_tab, votes_tab = st.tabs(
+        ["📚 Subjects", "🤝 Agreement", "🗳️ Votes"]
+    )
+
+    with summary_tab:
+        st.markdown("#### Subject mix overview")
         st.caption(
-            "Agreement scores are based on the shared votes counted above "
-            "and update automatically when filters change."
+            "Spot the policy areas that drive agreement or disagreement across the selected members."
         )
-        st.dataframe(
-            pairwise,
-            use_container_width=True,
-            hide_index=True,
+        if breakdown.empty:
+            st.info(
+                "Subject metadata is unavailable for the current selection of shared votes."
+            )
+        else:
+            category_chart = category_agreement_chart(breakdown)
+            if category_chart is not None:
+                st.altair_chart(category_chart, use_container_width=True)
+
+            subjects_in_breakdown = breakdown["Top-level subject"].tolist()
+            category_options = ["All categories", *subjects_in_breakdown]
+            default_focus_option = (
+                focus_default
+                if focus_default in subjects_in_breakdown
+                else "All categories"
+            )
+            focus_selection = st.selectbox(
+                "Drill down on a subject",
+                options=category_options,
+                index=category_options.index(default_focus_option),
+                help="Restrict the detailed vote table to a single top-level OEIL subject.",
+            )
+            if focus_selection != "All categories":
+                detail_focus_label = focus_selection
+
+            st.dataframe(
+                breakdown,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with agreement_tab:
+        st.markdown("#### Pair alignment insights")
+        st.caption(
+            "See how the selected members line up with one another and track agreement trends over time."
         )
+        if heatmap_chart is not None:
+            st.altair_chart(heatmap_chart, use_container_width=True)
+            st.caption(
+                "Darker cells indicate a higher share of matching votes between the pair."
+            )
+
+        if pair_label_to_members:
+            pair_index = pair_options.index(pair_default_label)
+            selected_pair_label = st.selectbox(
+                "Highlight a member pair",
+                options=pair_options,
+                index=pair_index,
+                help="Pick a pair to spotlight their agreement record and time-series trend.",
+            )
+            if selected_pair_label and selected_pair_label != "No pair selected":
+                selected_pair_token = pair_label_to_token.get(selected_pair_label)
+                pair_members = pair_label_to_members.get(selected_pair_label)
+                if pair_members:
+                    left_name, right_name = pair_members
+                trend_df = pairwise_trend(filtered, left_name, right_name)
+                trend_chart = pairwise_trend_chart(trend_df)
+                if trend_chart is not None:
+                    st.altair_chart(trend_chart, use_container_width=True)
+                elif trend_df.empty:
+                    st.info(
+                        "Not enough timestamped votes remain to draw a trend for this pair."
+                    )
+        else:
+            st.info("At least two members are required to analyse pairwise alignment.")
+
+        if not pairwise_df.empty:
+            st.dataframe(
+                pairwise_df,
+                use_container_width=True,
+                hide_index=True,
+            )
 
     detail_filtered = filtered.copy()
-    if detail_focus:
+    if detail_focus_label:
         detail_filtered = detail_filtered[
             detail_filtered["top_subjects"].apply(
-                lambda cats: detail_focus in _to_category_list(cats)
+                lambda cats: detail_focus_label in _to_category_list(cats)
             )
         ]
 
-    sync_query_params(detail_focus)
+    sync_query_params(detail_focus_label, selected_pair_token)
 
-    if detail_focus and detail_filtered.empty:
+    if detail_focus_label and detail_filtered.empty:
         st.info(
             "No votes remain after applying the current subject drill-down. "
             "Clear the drill-down selection to view all filtered votes."
@@ -761,29 +1117,43 @@ def main() -> None:
 
     display_df = format_vote_table(detail_filtered, selected_ids)
 
-    st.subheader("Detailed comparison")
-    detail_caption = (
-        "Vote positions use the official roll-call codes: FOR, AGAINST, ABSTENTION, "
-        "and DID_NOT_VOTE."
-    )
-    if detail_focus:
-        detail_caption += f" Showing only votes tagged with '{detail_focus}'."
-    st.caption(detail_caption)
+    with votes_tab:
+        st.markdown("#### Vote-by-vote detail")
+        st.caption(
+            "Inspect every shared vote side by side. Use the download buttons to keep a copy of the current view."
+        )
+        detail_caption = (
+            "Positions use the official roll-call codes: FOR, AGAINST, ABSTENTION, "
+            "and DID_NOT_VOTE."
+        )
+        if detail_focus_label:
+            detail_caption += f" Showing only votes tagged with '{detail_focus_label}'."
+        st.caption(detail_caption)
 
-    styled_or_plain = style_vote_table(display_df)
-    st.dataframe(
-        styled_or_plain,
-        use_container_width=True,
-        hide_index=True,
-    )
+        styled_or_plain = style_vote_table(display_df)
+        st.dataframe(
+            styled_or_plain,
+            use_container_width=True,
+            hide_index=True,
+        )
 
-    csv_data = display_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download table as CSV",
-        data=csv_data,
-        file_name="eu_parliament_vote_comparison.csv",
-        mime="text/csv",
-    )
+        csv_data = display_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download table as CSV",
+            data=csv_data,
+            file_name="eu_parliament_vote_comparison.csv",
+            mime="text/csv",
+        )
+
+        export_blob = build_export_package(
+            display_df, summary_metrics, breakdown, pairwise_df
+        )
+        st.download_button(
+            "Download comparison package (.zip)",
+            data=export_blob,
+            file_name="eu_parliament_vote_comparison.zip",
+            mime="application/zip",
+        )
 
 
 if __name__ == "__main__":
