@@ -1,6 +1,8 @@
 # EU_Comparator
 App that compares votes of different parliament members in European Parliament.
 
+Data Source: https://github.com/HowTheyVote/data/releases
+
 ## Running the application
 
 1. Install the dependencies:
