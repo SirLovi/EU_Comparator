@@ -1,5 +1,5 @@
 # EU_Comparator
-Script that compares votes of different parliament members in European Parliament.
+App that compares votes of different parliament members in European Parliament.
 
 ## Running the application
 
