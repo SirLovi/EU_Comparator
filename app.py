@@ -129,6 +129,12 @@ def format_vote_table(df: pd.DataFrame, selected_member_ids: List[int]) -> pd.Da
     ].copy()
 
     # Pretty timestamps
+    if not pd.api.types.is_datetime64_any_dtype(display_df["timestamp"]):
+        display_df["timestamp"] = pd.to_datetime(
+            display_df["timestamp"], errors="coerce", utc=True
+        )
+    if hasattr(display_df["timestamp"].dtype, "tz") and display_df["timestamp"].dt.tz is not None:
+        display_df["timestamp"] = display_df["timestamp"].dt.tz_convert(None)
     display_df["timestamp"] = display_df["timestamp"].dt.strftime("%Y-%m-%d %H:%M")
 
     # Rename headers
