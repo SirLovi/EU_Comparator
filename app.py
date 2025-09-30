@@ -110,6 +110,7 @@ def build_vote_matrix(selected_member_ids: List[int]) -> pd.DataFrame:
 
 
 def format_vote_table(df: pd.DataFrame, selected_member_ids: List[int]) -> pd.DataFrame:
+    """Select, rename, and prettify columns for display & download."""
     if df.empty:
         return df
 
@@ -126,25 +127,80 @@ def format_vote_table(df: pd.DataFrame, selected_member_ids: List[int]) -> pd.Da
             *selected_names,
         ]
     ].copy()
+
+    # Pretty timestamps
     display_df["timestamp"] = display_df["timestamp"].dt.strftime("%Y-%m-%d %H:%M")
+
+    # Rename headers
     display_df = display_df.rename(
         columns={
+            "timestamp": "Vote time",
             "display_title": "Vote title",
             "procedure_reference": "Procedure ref",
             "procedure_title": "Procedure title",
             "is_main": "Main vote",
+            "agreement": "Agreement",
             "shared_position": "Shared position",
         }
     )
+
+    # Human-friendly values
     display_df["Main vote"] = (
-        display_df["Main vote"].map({True: "Yes", False: "No"}).fillna("Unknown")
+        display_df["Main vote"].map({True: "Yes", False: "No"}).fillna("—")
     )
+    display_df["Shared position"] = display_df["Shared position"].fillna("—")
+
     return display_df
+
+
+def style_vote_table(
+    display_df: pd.DataFrame,
+) -> pd.io.formats.style.Styler | pd.DataFrame:
+    """Apply colour styling to highlight agreement and vote positions.
+    Returns a Styler if styling is applicable; otherwise the raw DataFrame.
+    """
+    if display_df.empty:
+        return display_df
+
+    position_styles = {
+        "FOR": "background-color: #d1e7dd; color: #0f5132; font-weight: 600;",
+        "AGAINST": "background-color: #f8d7da; color: #842029; font-weight: 600;",
+        "ABSTENTION": "background-color: #fff3cd; color: #664d03; font-weight: 600;",
+        "DID_NOT_VOTE": "background-color: #e2e3e5; color: #41464b;",
+        "—": "color: #6c757d;",
+        None: "color: #6c757d;",
+    }
+
+    def agreement_style(value: str) -> str:
+        if value == "Same":
+            return "background-color: #d1e7dd; color: #0f5132; font-weight: 700;"
+        if value == "Different":
+            return "background-color: #f8d7da; color: #842029; font-weight: 700;"
+        return ""
+
+    def position_style(value: str) -> str:
+        return position_styles.get(value, "")
+
+    base_columns = {
+        "Vote time",
+        "Vote title",
+        "Procedure ref",
+        "Procedure title",
+        "Main vote",
+        "Agreement",
+        "Shared position",
+    }
+    position_columns = [col for col in display_df.columns if col not in base_columns]
+
+    styler = display_df.style
+    styler = styler.map(agreement_style, subset=["Agreement"])
+    styler = styler.map(position_style, subset=["Shared position", *position_columns])
+    styler = styler.set_properties(**{"white-space": "nowrap"})
+    return styler
 
 
 def pairwise_agreement(df: pd.DataFrame, selected_member_ids: List[int]) -> pd.DataFrame:
     """Return a summary of how often each pair of members agreed."""
-
     if df.empty or len(selected_member_ids) < 2:
         return pd.DataFrame()
 
@@ -172,7 +228,6 @@ def pairwise_agreement(df: pd.DataFrame, selected_member_ids: List[int]) -> pd.D
 @st.cache_data(show_spinner=False)
 def load_last_updated() -> str:
     """Get the timestamp of the source dataset if available."""
-
     path = DATA_DIR / "last_updated.txt"
     if not path.exists():
         return "unknown"
@@ -270,8 +325,10 @@ def main() -> None:
         "Vote positions use the official roll-call codes: FOR, AGAINST, ABSTENTION, "
         "and DID_NOT_VOTE."
     )
+
+    styled_or_plain = style_vote_table(display_df)
     st.dataframe(
-        display_df,
+        styled_or_plain,
         use_container_width=True,
         hide_index=True,
     )
