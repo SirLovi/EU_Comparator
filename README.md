@@ -1,6 +1,24 @@
 # EU_Comparator
 Script that compares votes of different parliament members in European Parliament.
 
+## Running the application
+
+1. Install the dependencies:
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. Start the Streamlit app:
+
+   ```bash
+   streamlit run app.py
+   ```
+
+3. Use the sidebar to select up to six Members of the European Parliament. The main
+   panel summarises how often they voted the same way and lists each shared vote
+   alongside the individual positions.
+
 Tables
 members.csv
 Each row represents a Member of the European Parliament (MEP).
