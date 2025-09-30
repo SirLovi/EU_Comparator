@@ -128,14 +128,63 @@ def format_vote_table(df: pd.DataFrame, selected_member_ids: List[int]) -> pd.Da
     display_df["timestamp"] = display_df["timestamp"].dt.strftime("%Y-%m-%d %H:%M")
     display_df = display_df.rename(
         columns={
+            "timestamp": "Vote time",
             "display_title": "Vote title",
             "procedure_reference": "Procedure ref",
             "procedure_title": "Procedure title",
             "is_main": "Main vote",
+            "agreement": "Agreement",
             "shared_position": "Shared position",
         }
     )
+    display_df["Main vote"] = (
+        display_df["Main vote"].map({True: "Yes", False: "No"}).fillna("—")
+    )
+    display_df["Shared position"] = display_df["Shared position"].fillna("—")
     return display_df
+
+
+def style_vote_table(display_df: pd.DataFrame) -> pd.io.formats.style.Styler | pd.DataFrame:
+    """Apply colour styling to highlight agreement and vote positions."""
+
+    if display_df.empty:
+        return display_df
+
+    position_styles = {
+        "FOR": "background-color: #d1e7dd; color: #0f5132; font-weight: 600;",
+        "AGAINST": "background-color: #f8d7da; color: #842029; font-weight: 600;",
+        "ABSTENTION": "background-color: #fff3cd; color: #664d03; font-weight: 600;",
+        "DID_NOT_VOTE": "background-color: #e2e3e5; color: #41464b;",
+        "—": "color: #6c757d;",
+        None: "color: #6c757d;",
+    }
+
+    def agreement_style(value: str) -> str:
+        if value == "Same":
+            return "background-color: #d1e7dd; color: #0f5132; font-weight: 700;"
+        if value == "Different":
+            return "background-color: #f8d7da; color: #842029; font-weight: 700;"
+        return ""
+
+    def position_style(value: str) -> str:
+        return position_styles.get(value, "")
+
+    base_columns = {
+        "Vote time",
+        "Vote title",
+        "Procedure ref",
+        "Procedure title",
+        "Main vote",
+        "Agreement",
+        "Shared position",
+    }
+    position_columns = [col for col in display_df.columns if col not in base_columns]
+
+    styler = display_df.style
+    styler = styler.map(agreement_style, subset=["Agreement"])
+    styler = styler.map(position_style, subset=["Shared position", *position_columns])
+    styler = styler.set_properties(**{"white-space": "nowrap"})
+    return styler
 
 
 def main() -> None:
@@ -193,8 +242,10 @@ def main() -> None:
     display_df = format_vote_table(filtered, selected_ids)
 
     st.subheader("Detailed comparison")
+    styled_table = style_vote_table(display_df)
+
     st.dataframe(
-        display_df,
+        styled_table,
         use_container_width=True,
         hide_index=True,
     )
