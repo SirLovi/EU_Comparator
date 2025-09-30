@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from itertools import combinations
 from pathlib import Path
 from typing import Dict, List
 
@@ -135,7 +136,47 @@ def format_vote_table(df: pd.DataFrame, selected_member_ids: List[int]) -> pd.Da
             "shared_position": "Shared position",
         }
     )
+    display_df["Main vote"] = (
+        display_df["Main vote"].map({True: "Yes", False: "No"}).fillna("Unknown")
+    )
     return display_df
+
+
+def pairwise_agreement(df: pd.DataFrame, selected_member_ids: List[int]) -> pd.DataFrame:
+    """Return a summary of how often each pair of members agreed."""
+
+    if df.empty or len(selected_member_ids) < 2:
+        return pd.DataFrame()
+
+    selected_names = [member_lookup()[mid] for mid in selected_member_ids]
+    rows = []
+    total_votes = len(df)
+
+    for left, right in combinations(selected_names, 2):
+        same_mask = df[left] == df[right]
+        same_count = int(same_mask.sum())
+        different_count = int(total_votes - same_count)
+        agreement_rate = same_count / total_votes if total_votes else float("nan")
+        rows.append(
+            {
+                "Pair": f"{left} ↔ {right}",
+                "Same": same_count,
+                "Different": different_count,
+                "Agreement rate": f"{agreement_rate:.0%}" if total_votes else "N/A",
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(show_spinner=False)
+def load_last_updated() -> str:
+    """Get the timestamp of the source dataset if available."""
+
+    path = DATA_DIR / "last_updated.txt"
+    if not path.exists():
+        return "unknown"
+    return path.read_text(encoding="utf-8").strip()
 
 
 def main() -> None:
@@ -153,6 +194,18 @@ def main() -> None:
         help="Choose up to six members to compare their voting records.",
     )
 
+    st.sidebar.divider()
+    main_only = st.sidebar.toggle(
+        "Only include main votes",
+        value=False,
+        help=(
+            "Main votes capture the decision on the final text. "
+            "Disable to include amendments and procedural votes."
+        ),
+    )
+
+    st.sidebar.caption(f"Dataset last updated: {load_last_updated()}")
+
     name_to_id = dict(zip(members["full_name"], members["id"]))
     selected_ids = [name_to_id[name] for name in selected]
 
@@ -161,6 +214,9 @@ def main() -> None:
         return
 
     vote_matrix = build_vote_matrix(selected_ids)
+
+    if main_only:
+        vote_matrix = vote_matrix[vote_matrix["is_main"]]
 
     if vote_matrix.empty:
         st.warning(
@@ -177,6 +233,10 @@ def main() -> None:
     col1.metric("Shared votes analysed", total_votes)
     col2.metric("Votes with identical positions", same_votes)
     col3.metric("Votes with differing positions", different_votes)
+    st.caption(
+        "Metrics summarise all shared votes that match the sidebar filters. "
+        "Use the options below to focus on specific agreement patterns."
+    )
 
     filter_option = st.radio(
         "Filter votes by agreement",
@@ -190,9 +250,26 @@ def main() -> None:
     elif filter_option == "Only different":
         filtered = filtered[filtered["agreement"] == "Different"]
 
+    pairwise = pairwise_agreement(filtered, selected_ids)
+    if not pairwise.empty:
+        st.subheader("Pairwise agreement overview")
+        st.caption(
+            "Agreement scores are based on the shared votes counted above "
+            "and update automatically when filters change."
+        )
+        st.dataframe(
+            pairwise,
+            use_container_width=True,
+            hide_index=True,
+        )
+
     display_df = format_vote_table(filtered, selected_ids)
 
     st.subheader("Detailed comparison")
+    st.caption(
+        "Vote positions use the official roll-call codes: FOR, AGAINST, ABSTENTION, "
+        "and DID_NOT_VOTE."
+    )
     st.dataframe(
         display_df,
         use_container_width=True,
